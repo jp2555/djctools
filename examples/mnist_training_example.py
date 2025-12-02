@@ -113,7 +113,7 @@ def main():
     num_epochs = 5
     learning_rate = 0.001
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    num_gpus = min(num_gpus, 3)  # Limit to 3 GPUs for testing
+    num_gpus = min(num_gpus, 1)  # Limit to 1 GPU for testing FIsher computation
     
     # Data transformations
     transform = transforms.Compose([
@@ -136,9 +136,18 @@ def main():
     trainer = Trainer(model, optimizer, 
                       num_gpus=num_gpus)
     
+    # CrossEntropy loss used only for Fisher
+    fisher_loss_fn = nn.CrossEntropyLoss()
+    
     # Training loop
     for epoch in range(num_epochs):
         print(f"Starting epoch {epoch+1}")
+
+        # Enable Fisher for this epoch
+        trainer.compute_fisher = True           # turn on Fisher
+        trainer.fisher_batches = 50             # up to 50 batches
+        trainer.loss_fn_for_fisher = fisher_loss_fn
+        
         trainer.train_loop(train_loader)
         trainer.val_loop(val_loader)
     

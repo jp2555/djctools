@@ -10,6 +10,47 @@ from torch.nn import DataParallel
 
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
+
+def compute_fisher_batch(model, inputs, loss_fn):
+    """
+    Compute Fisher information for MNIST-like inputs:
+        F = E_batch[(∂L/∂x)^2] ∈ R^{28×28}
+
+    Parameters
+    ----------
+    model : nn.Module
+        The underlying model (not wrapped in DataParallel).
+        For MNISTModel, expects forward((x, y)).
+    inputs : tuple (x, y)
+        x: [B, 1, 28, 28], y: [B]
+    loss_fn : nn.Module
+        External loss function (e.g. nn.CrossEntropyLoss) used only for Fisher.
+
+    Returns
+    -------
+    fisher : torch.Tensor, shape [28, 28]
+        Per-pixel Fisher importance estimate for this batch.
+    """
+    x, y = inputs
+    # Fresh tensor for x with gradient tracking
+    x = x.clone().detach().requires_grad_(True)
+
+    # Forward: MNIST model expects (inputs, targets)
+    out = model((x, y))
+
+    loss = loss_fn(out, y)
+
+    grad_x, = torch.autograd.grad(
+        loss,
+        x,
+        create_graph=False,
+        retain_graph=False,
+    )  # [B, 1, 28, 28]
+
+    fisher = (grad_x ** 2).mean(dim=0).squeeze(0).detach()  # [28, 28]
+    return fisher
+
+
 class _CustomDataParallel(DataParallel):
     def scatter(
         self,
@@ -157,6 +198,14 @@ class Trainer:
         self.optimizer = optimizer
         self.verbose_level = verbose_level
 
+        # Fisher-related state (off by default)
+        self.compute_fisher = False           # user must set to True
+        self.fisher_batches = 20              # max number of batches to use
+        self.fisher_batch_count = 0
+        self.fisher_accumulator = None
+        self.fisher_sample_count = 0
+        self.loss_fn_for_fisher = None        # must be set externally (e.g. nn.CrossEntropyLoss)
+
     def _data_to_device(self, data, device):
         """
         Moves data to the specified device.
@@ -210,15 +259,23 @@ class Trainer:
         data_iterator = iter(train_loader)
         batch_idx = 0
 
+        # Reset Fisher stats at start of epoch if enabled
+        if self.compute_fisher:
+            self.fisher_batch_count = 0
+            self.fisher_sample_count = 0
+            self.fisher_accumulator = None
         while True:
             self.optimizer.zero_grad()
             batches = self.create_batches(data_iterator)
             if not batches:
                 break  # End of epoch
 
+            # Single-GPU: batches is [ (inputs, targets) ]
+            # Multi-GPU: batches is [ (inputs_0, targets_0), (inputs_1, targets_1), ... ]
             if len(batches) == 1:
                 batches = batches[0]
-
+            else:
+                batches = batches
             outputs = self.model(batches)  # DataParallel handles passing data to each GPU
             loss = sum_all_losses(self.model)
 
@@ -232,8 +289,51 @@ class Trainer:
             wandb_wrapper.log("total_loss", loss.item())
             if self.verbose_level > 0 and batch_idx % 10 == 0:
                 print(f'Batch {batch_idx}: Loss {loss.item()}')
+
+            # Fisher computation
+            if self.compute_fisher and self.fisher_batch_count < self.fisher_batches:
+                if self.loss_fn_for_fisher is None:
+                    raise RuntimeError("Trainer.loss_fn_for_fisher is None but compute_fisher=True.")
+
+                # For multi-GPU, just use first device's batch for Fisher
+                if isinstance(batches, list):
+                    batch_for_fisher = batches[0]
+                else:
+                    batch_for_fisher = batches
+
+                if not (isinstance(batch_for_fisher, (list, tuple)) and len(batch_for_fisher) == 2):
+                    raise RuntimeError("Fisher expects batch as (inputs, targets).")
+
+                x, y = batch_for_fisher
+
+                # Underlying nn.Module (not DataParallel wrapper)
+                core_model = self.model.module if hasattr(self.model, "module") else self.model
+
+                # Debug print to confirm Fisher is running
+                print(f"[FISHER] Batch {self.fisher_batch_count}: x={tuple(x.shape)}, y={tuple(y.shape)}")
+
+                fisher_batch = compute_fisher_batch(
+                    core_model,
+                    (x, y),
+                    self.loss_fn_for_fisher
+                )  # [28, 28]
+
+                bs = x.size(0)
+                if self.fisher_accumulator is None:
+                    self.fisher_accumulator = fisher_batch * bs
+                else:
+                    self.fisher_accumulator += fisher_batch * bs
+
+                self.fisher_sample_count += bs
+                self.fisher_batch_count += 1
             batch_idx += 1
             wandb_wrapper.flush()
+
+        # Finalize Fisher computation at epoch end
+        if self.compute_fisher and self.fisher_accumulator is not None and self.fisher_sample_count > 0:
+            fisher_map = self.fisher_accumulator / float(self.fisher_sample_count)
+            torch.save(fisher_map.cpu(), "/home/jpan/djctools/mnist_fisher_map.pt")
+            print("Saved Fisher map -> mnist_fisher_map.pt")
 
     def val_loop(self, val_loader):
         """
