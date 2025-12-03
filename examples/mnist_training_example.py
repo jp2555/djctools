@@ -19,6 +19,7 @@ from djctools.module_extensions import LossModule
 from djctools.module_extensions import LoggingModule
 from djctools.module_extensions import switch_all_logging, switch_all_losses
 from djctools.training import Trainer
+from trainer_extensions import Trainer_fi
 from djctools.wandb_tools import wandb_wrapper
 
 
@@ -70,33 +71,33 @@ class MNISTAccuracyModule(LoggingModule):
 class MNISTModel(nn.Module):
     def __init__(self):
         super(MNISTModel, self).__init__()
+
         self.loss_module = MNISTLossModule(logging_active=True, 
                                            loss_active=True,
                                            name="MNISTLossModule")
+
         self.accuracy_module = MNISTAccuracyModule(logging_active=True, name="MNISTAccuracyModule")
-        
+
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
         self.relu1 = nn.ReLU()
         self.pool = nn.MaxPool2d(2, 2)
         self.fc1 = nn.Linear(32 * 14 * 14, 10)
-    
+
     def forward(self, data):
-        # for pure inference, targets can be None and 
-        # the loss will not be computed if the loss modules 
-        # are all turned off
-        inputs, targets = data
-        x = inputs
+        x = data["inputs"]
+        y = data["labels"]
+
         x = self.conv1(x)
         x = self.relu1(x)
         x = self.pool(x)
         x = x.view(-1, 32 * 14 * 14)
         outputs = self.fc1(x)
 
-        self.loss_module(outputs, targets)
-        self.accuracy_module(outputs, targets)
-        
-        return outputs
+        self.loss_module(outputs, y)
+        self.accuracy_module(outputs, y)
 
+        return outputs
+    
 def main():
 
     # wandb_wrapper.deactivate()  # Deactivate wandb for testing
@@ -122,8 +123,11 @@ def main():
     ])
     
     # Load MNIST dataset
-    train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    val_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    # train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    # val_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    from mnist_djc_wrapper import MNIST_DJC
+    train_dataset = MNIST_DJC(torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform))
+    val_dataset = MNIST_DJC(torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform))
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
@@ -133,7 +137,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     # Initialize the Trainer, the total loss is always logged if wandb is enabled
-    trainer = Trainer(model, optimizer, 
+    trainer = Trainer_fi(model, optimizer, 
                       num_gpus=num_gpus)
     
     # CrossEntropy loss used only for Fisher

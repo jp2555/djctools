@@ -1,14 +1,46 @@
-# import as from djctools.training
+# import as from 
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from .module_extensions import sum_all_losses, clear_all_losses, flush_all_plotting
-from .wandb_tools import wandb_wrapper
+from djctools.module_extensions import sum_all_losses, clear_all_losses, flush_all_plotting
+from djctools.wandb_tools import wandb_wrapper
 import numpy as np
 import os
 from torch.nn import DataParallel
 
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
+
+
+def compute_fisher_batch(model, batch_dict, loss_fn):
+    """
+    Compute Fisher information matrix estimate for a single batch:
+        F = E_batch[(dL/dx)^2] 
+
+    Parameters
+    ----------
+    model : nn.Module
+        The underlying model (not wrapped in DataParallel).
+        For MNISTModel, expects forward((x, y)).
+    inputs : tuple (x, y)
+        x: [B, 1, 28, 28], y: [B]
+    loss_fn : nn.Module
+        External loss function (e.g. nn.CrossEntropyLoss) used only for Fisher.
+
+    Returns
+    -------
+    fisher : torch.Tensor, shape [28, 28]
+        Per-pixel Fisher importance estimate for this batch.
+    """
+    x = batch_dict[0]
+    y = batch_dict[1]
+    x = x.clone().detach().requires_grad_(True)
+    
+    out = model({"inputs": x, "labels": y})
+    loss = loss_fn(out, y)
+
+    grad_x, = torch.autograd.grad(loss, x, retain_graph=False)
+    fisher = (grad_x ** 2).mean(0).squeeze(0).detach()
+    return fisher
 
 class _CustomDataParallel(DataParallel):
     def scatter(
@@ -22,8 +54,9 @@ class _CustomDataParallel(DataParallel):
         such as lists of dictionaries or lists of lists of tensors.
         
         Args:
-            inputs (Tuple[Any, ...]): The input to be scattered - here this is a tuple with one entry. 
-                                      The latter entry is the list mentioned above.
+            inputs: a tuple whose first element is the list of batches
+                e.g. inputs = ([ (x_0,y_0), (x_1,y_1), ... ],)
+
             kwargs (Optional[Dict[str, Any]]): Keyword arguments.
             device_ids (Sequence[Union[int, torch.device]]): Target devices.
 
@@ -36,103 +69,24 @@ class _CustomDataParallel(DataParallel):
         # Example pseudo-code:
         scattered_inputs = []
         scattered_kwargs = []
+        per_device_batches = inputs[0]   # list of (x,y) 
         #print('inputs len',len(inputs))
         #print('inputs types',[type(i) for i in inputs])
         ##nested
         #print('inputs[0]',[type(i) for i in inputs[0]])
 
         for i, device_id in enumerate(device_ids):
-            # Create device-specific slices of the input.
-            device_input = (inputs[0][i],)  # ensure each replica receives a tuple of inputs
+            # Correct: pass the actual (x, y) for that device
+            device_input = per_device_batches[i]
             device_kwargs = kwargs if kwargs is not None else {}
-
-            scattered_inputs.append(device_input)
+            scattered_inputs.append((device_input,))
             scattered_kwargs.append(device_kwargs)
 
         return tuple(scattered_inputs), tuple(scattered_kwargs)
 
-
-
-class Trainer:
+class Trainer_fi:
     """
-    Trainer class for multi-GPU training using PyTorch Distributed Data Parallel (DDP).
-    
-    This Trainer class handles the initialization of DDP, manual batch distribution, 
-    and model synchronization across multiple GPUs, allowing flexibility for complex data structures 
-    and control over data loading. Compatible with both single and multi-GPU configurations, 
-    and can fall back to CPU if no GPU is available or `num_gpus=0` is specified.
-    
-    Attributes:
-        model (torch.nn.Module): The main model for training, wrapped in DDP if using multiple GPUs.
-        optimizer (torch.optim.Optimizer): The optimizer for updating model parameters.
-        num_gpus (int): Number of GPUs to use for training. Set to 0 for CPU training.
-        device_ids (list of int): List of GPU device IDs to use for training. Defaults to `[0, 1, ..., num_gpus-1]`.
-        device (str): The primary device for training, either a specified GPU or 'cpu'.
-        verbose_level (int): Controls verbosity of output, with `> 0` printing batch-wise loss updates.
-    
-    Methods:
-        _data_to_device(data, device):
-            Recursively moves data (tensors, lists, dictionaries) to the specified device.
-        
-        create_batches(data_iterator):
-            Manually creates and distributes batches across GPUs or CPU from the provided data iterator.
-    
-        train_loop(train_loader):
-            Executes the training loop over one epoch. Handles forward, backward passes, 
-            gradient updates, and logging of training losses.
-        
-        val_loop(val_loader):
-            Executes the validation loop, computing and logging validation losses. Runs without gradient updates.
-    
-        save_model(filepath):
-            Saves the model weights to a file. For DDP-wrapped models, uses `model.module.state_dict()`.
-    
-        load_model(filepath):
-            Loads model weights from a file. For DDP-wrapped models, loads weights into `model.module`.
-    
-        cleanup():
-            Cleans up the DDP process group after training. Recommended when using multiple training sessions 
-            in a single script to release GPU resources properly.
-
-        train_batch_callback(model, batch_number, batch_data):
-            Callback function that is called after each batch is processed during training.
-            The function should take the model, the batch number, and the batch data as arguments.
-            This function can be used to perform custom operations on the model or the data after each batch
-            and should be implemented by the user through inheritance. Please do not use for logging purposes,
-            use the wandb_wrapper.log() function instead.
-
-        val_batch_callback(model, batch_number, batch_data):
-            Callback function that is called after each batch is processed during validation.
-            The function should take the model, the batch number, and the batch data as arguments.
-            This function can be used to perform custom operations on the model or the data after each batch
-            and should be implemented by the user through inheritance. Please do not use for logging purposes,
-            use the wandb_wrapper.log() function instead.
-
-    
-    Example Usage:
-    --------------
-    >>> model = MyModel() # The model must use LossModule to define the loss(es)
-    >>> optimizer = torch.optim.Adam(model.parameters())
-    >>> trainer = Trainer(model, optimizer, num_gpus=2, verbose_level=1)
-    
-    >>> for epoch in range(num_epochs):
-    >>>     trainer.train_loop(train_loader)
-    >>>     trainer.val_loop(val_loader)
-    
-    >>> trainer.save_model("model_weights.pth")
-    >>> trainer.cleanup()  # Call when using multi-GPU to release resources
-    
-    Notes:
-    ------
-    - The `Trainer` class assumes single-process execution. Each batch is moved manually to the correct device,
-      allowing full control over batch distribution.
-    - For DDP, the model is wrapped with `DistributedDataParallel`, which handles gradient synchronization and
-      weight updates across GPUs. Manual gradient averaging is not required.
-    - This class is optimized for cases where each batch may consist of complex nested structures 
-      (e.g., lists of dictionaries or tuples). It can be used with both standard PyTorch data loaders 
-      and custom data iterators.
-    - `DistributedDataParallel` uses `nccl` backend by default for multi-GPU setups. If running on a single GPU 
-      or CPU, DDP is bypassed, and the model is trained in a standard non-parallel setup.
+    Trainer_fi class with Fisher Information computation
     """
     def __init__(self, model, optimizer, num_gpus=1, device_ids=None, verbose_level=0):
         
@@ -156,6 +110,15 @@ class Trainer:
         self.model = _CustomDataParallel(model, device_ids=self.device_ids) if len(self.device_ids) > 1 else model
         self.optimizer = optimizer
         self.verbose_level = verbose_level
+
+        # Fisher-related state (off by default)
+        self.compute_fisher = False 
+        self.fisher_accumulator = None
+        self.loss_fn_for_fisher = None        # set externally 
+
+        self.fisher_batches = 20              # max number of batches to use
+        self.fisher_batch_count = 0
+        self.fisher_sample_count = 0
 
     def _data_to_device(self, data, device):
         """
@@ -210,30 +173,86 @@ class Trainer:
         data_iterator = iter(train_loader)
         batch_idx = 0
 
+        # Reset Fisher stats at start of epoch if enabled
+        # Reset Fisher stats at start of epoch if enabled
+        if self.compute_fisher:
+            self.fisher_batch_count = 0
+            self.fisher_sample_count = 0
+            self.fisher_accumulator = None
+
         while True:
             self.optimizer.zero_grad()
             batches = self.create_batches(data_iterator)
             if not batches:
                 break  # End of epoch
 
+            # Single-GPU: batches is [ (inputs, targets) ]
+            # Multi-GPU: batches is [ (inputs_0, targets_0), (inputs_1, targets_1), ... ]
             if len(batches) == 1:
-                batches = batches[0]
+                batch = batches[0]
+            else:
+                batch = batches
+            # print("batches: ", len(batches), "batch: ", len(batch))
 
-            outputs = self.model(batches)  # DataParallel handles passing data to each GPU
+            outputs = self.model(batch)  # DataParallel handles passing data to each GPU
             loss = sum_all_losses(self.model)
 
             loss.backward()
             self.optimizer.step()
             clear_all_losses(self.model)
             flush_all_plotting(self.model)
-            self.train_batch_callback(self.model, batch_idx, batches)
+            self.train_batch_callback(self.model, batch_idx, batch)
 
             # Logging and printing
             wandb_wrapper.log("total_loss", loss.item())
             if self.verbose_level > 0 and batch_idx % 10 == 0:
                 print(f'Batch {batch_idx}: Loss {loss.item()}')
+
+            # Fisher computation
+            if self.compute_fisher and self.fisher_batch_count < self.fisher_batches:
+                if self.loss_fn_for_fisher is None:
+                    raise RuntimeError("Trainer.loss_fn_for_fisher is None but compute_fisher=True.")
+
+                # For multi-GPU, just use first device's batch for Fisher
+                if isinstance(batch, list):
+                    batch_for_fisher = batch[0]
+                else:
+                    batch_for_fisher = batch
+
+                if not isinstance(batch_for_fisher, dict):
+                    raise RuntimeError("Fisher expects batch as a dict with 'inputs' and 'labels' keys.")
+
+                x = batch_for_fisher["inputs"]
+                y = batch_for_fisher["labels"]
+
+                # Underlying nn.Module (not DataParallel wrapper)
+                core_model = self.model.module if hasattr(self.model, "module") else self.model
+
+                # Debug print to confirm Fisher is running
+                print(f"[FISHER] Batch {self.fisher_batch_count}: x={tuple(x.shape)}, y={tuple(y.shape)}")
+
+                fisher_batch = compute_fisher_batch(
+                    core_model,
+                    (x, y),
+                    self.loss_fn_for_fisher
+                )  # [28, 28]
+
+                bs = x.size(0)
+                if self.fisher_accumulator is None:
+                    self.fisher_accumulator = fisher_batch * bs
+                else:
+                    self.fisher_accumulator += fisher_batch * bs
+
+                self.fisher_sample_count += bs
+                self.fisher_batch_count += 1
             batch_idx += 1
             wandb_wrapper.flush()
+
+        # Finalize Fisher computation at epoch end
+        if self.compute_fisher and self.fisher_accumulator is not None and self.fisher_sample_count > 0:
+            fisher_map = self.fisher_accumulator / float(self.fisher_sample_count)
+            torch.save(fisher_map.cpu(), "/home/jpan/djctools/mnist_fisher_map.pt")
+            print("Saved Fisher map -> mnist_fisher_map.pt")
 
     def val_loop(self, val_loader):
         """
