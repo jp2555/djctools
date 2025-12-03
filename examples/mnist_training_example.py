@@ -163,9 +163,11 @@ def main():
     # now the model is in pure inference mode, that means
     # that all truth inputs can be set to None and the model
     # will not compute losses or log any metrics,
-    # such this this call not fail
+    # so this call will not fail
     mock_data = torch.randn(1, 1, 28, 28).to(device)
-    model([mock_data, None])
+
+    # Our MNISTModel.forward expects a dict with "inputs" and "labels"
+    model({"inputs": mock_data, "labels": None})
 
     # Save the trained model for inference
     trainer.save_model("mnist_model.pth")

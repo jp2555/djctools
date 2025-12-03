@@ -31,16 +31,28 @@ def compute_fisher_batch(model, batch_dict, loss_fn):
     fisher : torch.Tensor, shape [28, 28]
         Per-pixel Fisher importance estimate for this batch.
     """
-    x = batch_dict[0]
-    y = batch_dict[1]
-    x = x.clone().detach().requires_grad_(True)
-    
-    out = model({"inputs": x, "labels": y})
-    loss = loss_fn(out, y)
+    x = batch_dict['inputs']
+    y = batch_dict['labels']
+    # Completely separate graph from training:
+    x_f = x.detach().clone().requires_grad_(True)
 
-    grad_x, = torch.autograd.grad(loss, x, retain_graph=False)
-    fisher = (grad_x ** 2).mean(0).squeeze(0).detach()
+    # Rebuild a mini-batch dict for this second forward
+    batch_f = {"inputs": x_f, "labels": y}
+
+    # Forward through the model (MNISTModel expects dict)
+    out = model(batch_f)          # logits
+    # out = model((batch_f,))
+    loss_f = loss_fn(out, y)
+
+    grad_x, = torch.autograd.grad(
+        loss_f,
+        x_f,
+        retain_graph=False,
+        create_graph=False,
+    )  # [B, 1, 28, 28]
+    fisher = (grad_x ** 2).mean(dim=0).squeeze(0).detach()  # [28, 28]
     return fisher
+
 
 class _CustomDataParallel(DataParallel):
     def scatter(
@@ -194,11 +206,17 @@ class Trainer_fi:
                 batch = batches
             # print("batches: ", len(batches), "batch: ", len(batch))
 
-            outputs = self.model(batch)  # DataParallel handles passing data to each GPU
+            # IMPORTANT: clear any leftover loss tensors & logs BEFORE forward
+            clear_all_losses(self.model)
+            flush_all_plotting(self.model)
+
+            outputs = self.model(batch)
+            # outputs = self.model((batch,))
             loss = sum_all_losses(self.model)
 
             loss.backward()
             self.optimizer.step()
+
             clear_all_losses(self.model)
             flush_all_plotting(self.model)
             self.train_batch_callback(self.model, batch_idx, batch)
@@ -213,38 +231,37 @@ class Trainer_fi:
                 if self.loss_fn_for_fisher is None:
                     raise RuntimeError("Trainer.loss_fn_for_fisher is None but compute_fisher=True.")
 
-                # For multi-GPU, just use first device's batch for Fisher
+                # For multi-GPU, just use the first device's batch
                 if isinstance(batch, list):
                     batch_for_fisher = batch[0]
                 else:
                     batch_for_fisher = batch
 
                 if not isinstance(batch_for_fisher, dict):
-                    raise RuntimeError("Fisher expects batch as a dict with 'inputs' and 'labels' keys.")
+                    raise RuntimeError("Fisher expects batch as a dict with 'inputs' and 'labels'.")
 
-                x = batch_for_fisher["inputs"]
-                y = batch_for_fisher["labels"]
-
-                # Underlying nn.Module (not DataParallel wrapper)
+                # Underlying model (not DataParallel)
                 core_model = self.model.module if hasattr(self.model, "module") else self.model
 
-                # Debug print to confirm Fisher is running
-                print(f"[FISHER] Batch {self.fisher_batch_count}: x={tuple(x.shape)}, y={tuple(y.shape)}")
+                # Debug print so you see it runs
+                print(f"[FISHER] Batch {self.fisher_batch_count}: "
+                    f"x={tuple(batch_for_fisher['inputs'].shape)}, "
+                    f"y={tuple(batch_for_fisher['labels'].shape)}")
 
                 fisher_batch = compute_fisher_batch(
                     core_model,
-                    (x, y),
-                    self.loss_fn_for_fisher
-                )  # [28, 28]
+                    batch_for_fisher,
+                    self.loss_fn_for_fisher,
+                )
 
-                bs = x.size(0)
+                bs = batch_for_fisher["inputs"].size(0)
                 if self.fisher_accumulator is None:
                     self.fisher_accumulator = fisher_batch * bs
                 else:
                     self.fisher_accumulator += fisher_batch * bs
-
                 self.fisher_sample_count += bs
                 self.fisher_batch_count += 1
+
             batch_idx += 1
             wandb_wrapper.flush()
 
@@ -255,37 +272,52 @@ class Trainer_fi:
             print("Saved Fisher map -> mnist_fisher_map.pt")
 
     def val_loop(self, val_loader):
-        """
-        Runs the validation loop.
-
-        Args:
-            val_loader (DataLoader): The data loader for validation data.
-        """
         self.model.eval()
         data_iterator = iter(val_loader)
         batch_idx = 0
+        total_loss = 0.0
+        count = 0
 
         with torch.no_grad():
             while True:
                 batches = self.create_batches(data_iterator)
                 if not batches:
-                    break  # End of epoch
-                if len(batches) == 1: #no multi gpu
-                    batches = batches[0]
-    
-                outputs = self.model(batches)  # DataParallel handles passing data to each GPU
-                loss = sum_all_losses(self.model)
+                    break
+
+                # Always use GPU0 batch
+                batch_for_val = batches[0]
+
+                if not isinstance(batch_for_val, dict):
+                    raise RuntimeError("Validation expects batch as dict with 'inputs' and 'labels'.")
+
+                batch = {
+                    "inputs": batch_for_val["inputs"],
+                    "labels": batch_for_val["labels"],
+                }
+
                 clear_all_losses(self.model)
                 flush_all_plotting(self.model)
-                self.val_batch_callback(self.model, batch_idx, batches)
-    
-                # Logging and printing
-                wandb_wrapper.log("total_loss", loss.item())
-                if self.verbose_level > 0 and batch_idx % 10 == 0:
-                    print(f'Validation Batch {batch_idx}: Loss {loss.item()}')
-                batch_idx += 1
-                wandb_wrapper.flush(prefix="val_")
 
+                outputs = self.model(batch)
+
+                loss = sum_all_losses(self.model)
+
+                total_loss += loss.item()
+                count += 1
+
+                clear_all_losses(self.model)
+                flush_all_plotting(self.model)
+
+                wandb_wrapper.log("val_loss", loss.item())
+
+                if self.verbose_level > 0 and batch_idx % 10 == 0:
+                    print(f'Val Batch {batch_idx}: Loss {loss.item()}')
+
+                batch_idx += 1
+
+        avg_loss = total_loss / max(count, 1)
+        wandb_wrapper.log("avg_val_loss", avg_loss)
+        return avg_loss
 
     def save_model(self, filepath):
         """Saves the model weights to a file."""
