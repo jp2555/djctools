@@ -1,3 +1,4 @@
+*/._*.py
 data/*
 venv/*
 */**/*.egg-info
