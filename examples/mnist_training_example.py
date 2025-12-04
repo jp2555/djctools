@@ -148,20 +148,12 @@ def main():
     trainer = Trainer_fi(model, optimizer, 
                       num_gpus=num_gpus)
     
-    # CrossEntropy loss used only for Fisher
-    fisher_loss_fn = nn.CrossEntropyLoss()
-    
     # Training loop
     for epoch in range(num_epochs):
         print(f"Starting epoch {epoch+1}")
 
-        # Enable Fisher for this epoch
-        trainer.compute_fisher = True           # turn on Fisher
-        trainer.fisher_batches = 50             # up to 50 batches
-        trainer.loss_fn_for_fisher = fisher_loss_fn
-
         trainer.enable_pruning(pruner)
-    
+
         trainer.train_loop(train_loader)
         trainer.val_loop(val_loader)
     

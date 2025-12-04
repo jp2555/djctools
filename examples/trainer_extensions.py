@@ -191,15 +191,6 @@ class Trainer_fi:
         self.optimizer = optimizer
         self.verbose_level = verbose_level
 
-        # Fisher-related state (off by default)
-        self.compute_fisher = False 
-        self.fisher_accumulator = None
-        self.loss_fn_for_fisher = None        # set externally 
-
-        self.fisher_batches = 20              # max number of batches to use
-        self.fisher_batch_count = 0
-        self.fisher_sample_count = 0
-
         self.pruner = None
         self.use_pruning = False
 
@@ -260,13 +251,6 @@ class Trainer_fi:
         data_iterator = iter(train_loader)
         batch_idx = 0
 
-        # Reset Fisher stats at start of epoch if enabled
-        # Reset Fisher stats at start of epoch if enabled
-        if self.compute_fisher:
-            self.fisher_batch_count = 0
-            self.fisher_sample_count = 0
-            self.fisher_accumulator = None
-
         while True:
             self.optimizer.zero_grad()
             batches = self.create_batches(data_iterator)
@@ -306,50 +290,8 @@ class Trainer_fi:
             if self.verbose_level > 0 and batch_idx % 10 == 0:
                 print(f'Batch {batch_idx}: Loss {loss.item()}')
 
-            # Fisher computation
-            if self.compute_fisher and self.fisher_batch_count < self.fisher_batches:
-                if self.loss_fn_for_fisher is None:
-                    raise RuntimeError("Trainer.loss_fn_for_fisher is None but compute_fisher=True.")
-
-                # For multi-GPU, just use the first device's batch
-                if isinstance(batch, list):
-                    batch_for_fisher = batch[0]
-                else:
-                    batch_for_fisher = batch
-
-                if not isinstance(batch_for_fisher, dict):
-                    raise RuntimeError("Fisher expects batch as a dict with 'inputs' and 'labels'.")
-
-                # Underlying model (not DataParallel)
-                core_model = self.model.module if hasattr(self.model, "module") else self.model
-
-                # Debug print so you see it runs
-                print(f"[FISHER] Batch {self.fisher_batch_count}: "
-                    f"x={tuple(batch_for_fisher['inputs'].shape)}, "
-                    f"y={tuple(batch_for_fisher['labels'].shape)}")
-
-                fisher_batch = compute_fisher_batch(
-                    core_model,
-                    batch_for_fisher,
-                    self.loss_fn_for_fisher,
-                )
-
-                bs = batch_for_fisher["inputs"].size(0)
-                if self.fisher_accumulator is None:
-                    self.fisher_accumulator = fisher_batch * bs
-                else:
-                    self.fisher_accumulator += fisher_batch * bs
-                self.fisher_sample_count += bs
-                self.fisher_batch_count += 1
-
             batch_idx += 1
             wandb_wrapper.flush()
-
-        # Finalize Fisher computation at epoch end
-        if self.compute_fisher and self.fisher_accumulator is not None and self.fisher_sample_count > 0:
-            fisher_map = self.fisher_accumulator / float(self.fisher_sample_count)
-            torch.save(fisher_map.cpu(), "/home/jpan/djctools/mnist_fisher_map.pt")
-            print("Saved Fisher map -> mnist_fisher_map.pt")
 
     def val_loop(self, val_loader):
         self.model.eval()
