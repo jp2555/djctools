@@ -22,6 +22,9 @@ from djctools.training import Trainer
 from trainer_extensions import Trainer_fi
 from djctools.wandb_tools import wandb_wrapper
 
+from fisher_pruning import FisherPruningGate
+from train_fisher_approximator_mnist import FisherApproximator
+
 
 # Define a custom LossModule
 class MNISTLossModule(LossModule):
@@ -107,9 +110,14 @@ def main():
 
     # Set device to CUDA if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load fisher approximator
+    approx = FisherApproximator().to(device)  # CNN appoximator of Fisher
+    approx.load_state_dict(torch.load("fisher_approx_mnist.pt", map_location=device))
+    pruner = FisherPruningGate(approx, sparsity=0.2)
     
     # Hyperparameters
-    # each GPU will receive a batch of 64 samples
+    # each GsPU will receive a batch of 64 samples
     batch_size = 128 
     num_epochs = 5
     learning_rate = 0.001
@@ -151,7 +159,9 @@ def main():
         trainer.compute_fisher = True           # turn on Fisher
         trainer.fisher_batches = 50             # up to 50 batches
         trainer.loss_fn_for_fisher = fisher_loss_fn
-        
+
+        trainer.enable_pruning(pruner)
+    
         trainer.train_loop(train_loader)
         trainer.val_loop(val_loader)
     

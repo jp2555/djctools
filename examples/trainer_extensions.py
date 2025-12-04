@@ -54,6 +54,74 @@ def compute_fisher_batch(model, batch_dict, loss_fn):
     return fisher
 
 
+def compute_fisher_batch_per_image(model, batch_dict, loss_fn):
+    """
+    Compute per-pixel Fisher information for each image in the batch:
+        F_n(i,j) ~= (dL_n/dx_n(i,j))^2
+
+    where n indexes images in the batch and (i,j) are pixel indices.
+
+    Returns
+    -------
+    fisher_per_img : torch.Tensor
+        Tensor of shape [B, 1, 28, 28] with per-pixel Fisher values
+        for each image in the batch.
+    """
+
+    # Move batch to the same device as the model
+    device = next(model.parameters()).device
+    x = batch_dict["inputs"].to(device)
+    y = batch_dict["labels"].to(device)
+
+    B = x.size(0)
+
+    # Make x a leaf tensor with grad
+    x = x.detach().clone().requires_grad_(True)
+
+    # Storage for per-image Fisher maps
+    fisher_per_img = torch.zeros_like(x)
+
+    # Remember training/eval mode and switch to eval for consistency
+    was_training = model.training
+    model.eval()
+
+    for i in range(B):
+        # Clear old grads
+        model.zero_grad()
+        if x.grad is not None:
+            x.grad.zero_()
+
+        # One-image mini-batch
+        xi = x[i:i+1]          # [1, 1, 28, 28]
+        yi = y[i:i+1]          # [1]
+
+        # Forward pass – MNISTModel.forward expects a dict
+        outputs = model({"inputs": xi, "labels": yi})
+
+        # If your model returns (logits, ...) keep only logits
+        if isinstance(outputs, (tuple, list)):
+            logits = outputs[0]
+        else:
+            logits = outputs
+
+        # Per-image loss
+        loss_i = loss_fn(logits, yi)
+
+        # Backprop to get dL/dx for this image
+        loss_i.backward()
+
+        # Gradient w.r.t. x lives in x.grad; take slice i
+        grad_x_i = x.grad[i].detach()  # [1, 28, 28]
+
+        # Fisher ~ squared gradient
+        fisher_per_img[i] = grad_x_i.pow(2)
+
+    # Restore original mode
+    model.train(was_training)
+
+    return fisher_per_img
+
+
 class _CustomDataParallel(DataParallel):
     def scatter(
         self,
@@ -132,6 +200,13 @@ class Trainer_fi:
         self.fisher_batch_count = 0
         self.fisher_sample_count = 0
 
+        self.pruner = None
+        self.use_pruning = False
+
+    def enable_pruning(self, pruner):
+        self.pruner = pruner
+        self.use_pruning = True
+
     def _data_to_device(self, data, device):
         """
         Moves data to the specified device.
@@ -202,6 +277,11 @@ class Trainer_fi:
             # Multi-GPU: batches is [ (inputs_0, targets_0), (inputs_1, targets_1), ... ]
             if len(batches) == 1:
                 batch = batches[0]
+                # pruning integration
+                if self.use_pruning:
+                    x = batch["inputs"]
+                    pruned_x, fisher_pred = self.pruner(x)
+                    batch["inputs"] = pruned_x
             else:
                 batch = batches
             # print("batches: ", len(batches), "batch: ", len(batch))

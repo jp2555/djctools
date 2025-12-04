@@ -1,4 +1,10 @@
 */._*.py
+*.pt
+._*.py
+examples/._*.py
+*visualization*/*
+._*.sh
+*.pth
 data/*
 venv/*
 */**/*.egg-info
