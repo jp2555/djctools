@@ -70,56 +70,35 @@ def compute_fisher_batch_per_image(model, batch_dict, loss_fn):
 
     # Move batch to the same device as the model
     device = next(model.parameters()).device
+
     x = batch_dict["inputs"].to(device)
     y = batch_dict["labels"].to(device)
-
     B = x.size(0)
 
     # Make x a leaf tensor with grad
     x = x.detach().clone().requires_grad_(True)
 
     # Storage for per-image Fisher maps
-    fisher_per_img = torch.zeros_like(x)
-
-    # Remember training/eval mode and switch to eval for consistency
-    was_training = model.training
     model.eval()
+    fisher = torch.zeros_like(x)
 
     for i in range(B):
-        # Clear old grads
-        model.zero_grad()
-        if x.grad is not None:
-            x.grad.zero_()
+        # Forward pass for a single image but using the entire batch tensor
+        logits = model({"inputs": x[i:i+1], "labels": y[i:i+1]})
+        loss_i = loss_fn(logits, y[i:i+1])   # scalar
 
-        # One-image mini-batch
-        xi = x[i:i+1]          # [1, 1, 28, 28]
-        yi = y[i:i+1]          # [1]
+        # Compute gradient ∂L_i / ∂x using autograd.grad
+        grad_x_i = torch.autograd.grad(
+            outputs=loss_i,
+            inputs=x,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=False,
+        )[0][i]   # select the i-th sample, the only non-zero grad
 
-        # Forward pass – MNISTModel.forward expects a dict
-        outputs = model({"inputs": xi, "labels": yi})
+        fisher[i] = grad_x_i.pow(2).detach()
 
-        # If your model returns (logits, ...) keep only logits
-        if isinstance(outputs, (tuple, list)):
-            logits = outputs[0]
-        else:
-            logits = outputs
-
-        # Per-image loss
-        loss_i = loss_fn(logits, yi)
-
-        # Backprop to get dL/dx for this image
-        loss_i.backward()
-
-        # Gradient w.r.t. x lives in x.grad; take slice i
-        grad_x_i = x.grad[i].detach()  # [1, 28, 28]
-
-        # Fisher ~ squared gradient
-        fisher_per_img[i] = grad_x_i.pow(2)
-
-    # Restore original mode
-    model.train(was_training)
-
-    return fisher_per_img
+    return fisher
 
 
 class _CustomDataParallel(DataParallel):
