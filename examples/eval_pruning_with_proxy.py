@@ -7,7 +7,7 @@
 # mnist_training_example.py.
 
 DEBUG_PROXY_ONCE = True
-DEBUG_TRUE_ONCE = True
+DEBUG_TRUE_ONCE = True  # currently unused, kept for future debugging
 
 import os
 import torch
@@ -23,7 +23,9 @@ from mnist_djc_wrapper import MNIST_DJC
 from trainer_extensions import compute_fisher_per_image
 
 
-# pruning
+# ----------------------------------------------------------------------
+# Pruning helper
+# ----------------------------------------------------------------------
 def apply_per_image_pruning(inputs, fisher_map, sparsity: float) -> torch.Tensor:
     """
     Per-image pruning based on Fisher importance.
@@ -50,8 +52,7 @@ def apply_per_image_pruning(inputs, fisher_map, sparsity: float) -> torch.Tensor
     for i in range(B):
         fi = fisher_flat[i]  # [num_pixels]
 
-        # Indices of the k smallest Fisher values
-        # (largest=False gives smallest; no thresholding ambiguity)
+        # Indices of the k smallest Fisher values (no threshold ambiguity)
         _, idx_small = torch.topk(fi, k, largest=False)
 
         # Start with all-ones mask
@@ -64,6 +65,60 @@ def apply_per_image_pruning(inputs, fisher_map, sparsity: float) -> torch.Tensor
     return pruned
 
 
+# ----------------------------------------------------------------------
+# Plotting helper
+# ----------------------------------------------------------------------
+def plot_accuracy_vs_sparsity(
+    sparsities,
+    baseline_acc,
+    proxy_acc_dict,
+    true_acc_dict,
+    out_dir="pruning_plots",
+    filename="accuracy_vs_sparsity.png",
+):
+    """
+    Plot Accuracy vs Sparsity for:
+      - baseline (no pruning)
+      - proxy-based Fisher pruning
+      - true Fisher pruning
+
+    sparsities      : iterable of sparsity values (floats)
+    baseline_acc    : scalar baseline accuracy (no pruning)
+    proxy_acc_dict  : dict mapping sparsity -> accuracy (proxy FI)
+    true_acc_dict   : dict mapping sparsity -> accuracy (true FI)
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+
+    # Ensure consistent ordering
+    sparsities = sorted(sparsities)
+
+    baseline_vals = [baseline_acc for _ in sparsities]
+    proxy_vals    = [proxy_acc_dict[s] for s in sparsities]
+    true_vals     = [true_acc_dict[s] for s in sparsities]
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(sparsities, baseline_vals, marker="o", label="Baseline (no pruning)")
+    plt.plot(sparsities, proxy_vals,    marker="o", label="Proxy FI pruning")
+    plt.plot(sparsities, true_vals,     marker="o", label="True FI pruning")
+
+    plt.xlabel("Sparsity (fraction of pixels pruned)")
+    plt.ylabel("Accuracy [%]")
+    plt.title("MNIST – Accuracy vs Sparsity")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print(f"\nSaved Accuracy vs Sparsity plot to: {out_path}")
+    return out_path
+
+
+# ----------------------------------------------------------------------
+# Evaluation helper
+# ----------------------------------------------------------------------
 def evaluate_accuracy(
     model: MNISTModel,
     dataloader: DataLoader,
@@ -71,12 +126,17 @@ def evaluate_accuracy(
     mode: str = "none",
     sparsity: float = 0.0,
 ):
+    """
+    mode:
+      - "none"  : no pruning
+      - "proxy" : use model.compute_approx_fisher_per_image
+      - "true"  : use compute_fisher_per_image with gradients
+    """
     model.eval()
     total = 0
     correct = 0
 
     compute_true_fisher = (mode == "true")
-    use_proxy_fisher = (mode == "proxy")
 
     for batch in dataloader:
         x = batch["inputs"].to(device)   # [B,1,28,28]
@@ -88,13 +148,12 @@ def evaluate_accuracy(
             fi_true = compute_fisher_per_image(
                 model,
                 {"inputs": x, "labels": y},
-                model._fisher_ce,  # your CE loss for FI
+                model._fisher_ce,  # CE loss for FI
             )  # [B,1,28,28]
 
             x_in = apply_per_image_pruning(x, fi_true, sparsity)
 
-            # We don't need grads for the classification itself, so we can
-            # optionally turn no_grad on just for the forward_logits call:
+            # We don't need grads for classification itself
             with torch.no_grad():
                 logits = model.forward_logits(x_in)
 
@@ -122,7 +181,6 @@ def evaluate_accuracy(
                             f"mean={fisher_hat.mean().item():.4g}"
                         )
                         DEBUG_PROXY_ONCE = False
-
                 else:
                     x_in = x
 
@@ -135,6 +193,9 @@ def evaluate_accuracy(
     return 100.0 * correct / total
 
 
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -181,8 +242,7 @@ def main():
     # ------------------------------
     # W&B init
     # ------------------------------
-    # You can adjust this grid if you like
-    sparsity_list = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    sparsity_list = [0.0, 0.1, 0.2, 0.3]  # adjust as you like (true FI gets heavy!)
 
     wandb_wrapper.init(
         project="mnist_pruning_eval",
@@ -213,7 +273,6 @@ def main():
         proxy_results.append((s, acc))
         print(f"[Proxy] sparsity={s:.2f}, accuracy={acc:.2f}%")
 
-        # wandb_wrapper.log expects (metric_name, value)
         wandb_wrapper.log("sparsity", s)
         wandb_wrapper.log("accuracy_proxy", acc)
         wandb_wrapper.flush()
@@ -234,69 +293,38 @@ def main():
         wandb_wrapper.log("accuracy_true_fisher", acc)
         wandb_wrapper.flush()
 
+    # Convert to dicts for easy lookup
+    acc_proxy = dict(proxy_results)
+    acc_true  = dict(true_results)
+
     # ------------------------------
-    # Make a Matplotlib plot: accuracy vs sparsity
+    # Summary printout
     # ------------------------------
-    fig, ax = plt.subplots(figsize=(6, 4))
-
-    # Unpack results
-    sparsities = sparsity_list
-    proxy_accs = [dict(proxy_results)[s] for s in sparsities]
-    true_accs = [dict(true_results)[s] for s in sparsities] if true_results else None
-
-    # Baseline as horizontal line
-    ax.axhline(
-        baseline_acc,
-        linestyle="--",
-        linewidth=1.0,
-        label=f"Baseline (no pruning): {baseline_acc:.2f}%",
-    )
-
-    ax.plot(
-        sparsities,
-        proxy_accs,
-        marker="o",
-        linestyle="-",
-        label="Proxy Fisher pruning",
-    )
-
-    if true_accs is not None:
-        ax.plot(
-            sparsities,
-            true_accs,
-            marker="s",
-            linestyle="-",
-            label="True Fisher pruning",
+    print("\n=== Summary: Accuracy vs Sparsity ===")
+    print("sparsity   baseline   proxy_FI   true_FI")
+    for s in sparsity_list:
+        print(
+            f"{s:8.2f}  "
+            f"{baseline_acc:9.2f}  "
+            f"{acc_proxy[s]:9.2f}  "
+            f"{acc_true[s]:8.2f}"
         )
 
-    ax.set_xlabel("Pruning sparsity (fraction of pixels removed)")
-    ax.set_ylabel("Accuracy [%]")
-    ax.set_title("MNIST accuracy vs. pruning sparsity")
-    ax.set_ylim(0, 100)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
+    # ------------------------------
+    # Plot all curves & log to W&B
+    # ------------------------------
+    plot_path = plot_accuracy_vs_sparsity(
+        sparsities=sparsity_list,
+        baseline_acc=baseline_acc,
+        proxy_acc_dict=acc_proxy,
+        true_acc_dict=acc_true,
+    )
 
-    plot_path = "mnist_pruning_curves.png"
-    plt.tight_layout()
-    plt.savefig(plot_path, dpi=200)
-    plt.close(fig)
-
-    # Log plot to W&B as image if run is active
     if getattr(wandb_wrapper, "initialized", False):
         img = wandb.Image(plot_path, caption="Accuracy vs pruning sparsity")
         wandb.log({"pruning_curves": img})
 
     wandb_wrapper.finish()
-
-    # Final summary printout
-    print("\n=== Summary: Accuracy vs Sparsity ===")
-    print("sparsity   baseline   proxy_FI   true_FI")
-    for s in sparsities:
-        proxy_acc = dict(proxy_results).get(s, float("nan"))
-        true_acc = dict(true_results).get(s, float("nan"))
-        print(
-            f"{s:8.2f}  {baseline_acc:8.2f}  {proxy_acc:8.2f}  {true_acc:8.2f}"
-        )
 
 
 if __name__ == "__main__":
