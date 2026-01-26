@@ -1,11 +1,9 @@
-# build_mnist_fisher_dataset.py
-
 import torch
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
 
-from trainer_extensions import compute_fisher_batch_per_image
+from trainer_extensions import compute_fisher_per_image, compute_fisher_per_image_vmap
 
 def build_fisher_dataset(model,
                          device,
@@ -13,7 +11,6 @@ def build_fisher_dataset(model,
                          max_batches=None,
                          save_path="mnist_fisher_stageA.pt"):
     """
-    Stage A:
     Given a trained MNIST model, compute per-image Fisher maps on the
     training set and save them along with the images and labels.
 
@@ -29,7 +26,6 @@ def build_fisher_dataset(model,
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
-
     train_set = torchvision.datasets.MNIST(
         root="./data", train=True, download=True, transform=transform
     )
@@ -39,18 +35,15 @@ def build_fisher_dataset(model,
 
     model.eval()
     model.to(device)
-
     ce_loss = torch.nn.CrossEntropyLoss()
 
-    all_images = []
-    all_labels = []
-    all_fisher = []
+    all_images, all_labels, all_fisher = [], [], []
 
     with torch.no_grad():
         # we will temporarily re-enable grad only for Fisher computation per batch
         pass
 
-    # We *do* need gradients for Fisher, so we wrap the loop in no_grad=False
+    # We do need gradients for Fisher, so we wrap the loop in no_grad=False
     batch_count = 0
     for images, labels in train_loader:
         batch_count += 1
@@ -59,16 +52,13 @@ def build_fisher_dataset(model,
 
         images = images.to(device)
         labels = labels.to(device)
-
         batch_dict = {
             "inputs": images,
             "labels": labels,
         }
 
         # Need grads here:
-        # compute_fisher_batch_per_image handles requires_grad on inputs,
-        # and uses ce_loss as the NLL.
-        fi_batch = compute_fisher_batch_per_image(
+        fi_batch = compute_fisher_per_image(
             model=model,
             batch_dict=batch_dict,
             loss_fn=ce_loss
@@ -77,14 +67,13 @@ def build_fisher_dataset(model,
         all_images.append(images.detach().cpu())
         all_labels.append(labels.detach().cpu())
         all_fisher.append(fi_batch.detach().cpu())
-
         print(f"[Stage A] Processed batch {batch_count}")
 
     images_tensor = torch.cat(all_images, dim=0)         # [N, 1, 28, 28]
     labels_tensor = torch.cat(all_labels, dim=0)         # [N]
     fisher_tensor = torch.cat(all_fisher, dim=0)         # [N, 1, 28, 28]
 
-    # Stabilised target as in your note: fi := log(1 + Fi)
+    # Stabilised target to save: fi := log(1 + Fi)
     fisher_log1p = torch.log1p(fisher_tensor)
 
     torch.save(
@@ -100,7 +89,7 @@ def build_fisher_dataset(model,
 
 
 if __name__ == "__main__":
-    # Example usage assuming you have a trained model checkpoint
+    # saving the model for debugging for now
     from mnist_djc_wrapper import build_trained_mnist_model
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

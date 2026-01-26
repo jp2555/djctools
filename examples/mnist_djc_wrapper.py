@@ -1,3 +1,5 @@
+# examples/mnist_djc_wrapper.py
+
 from torch.utils.data import Dataset
 import torch
 import os
@@ -19,11 +21,6 @@ class MNIST_DJC(Dataset):
             "labels": y,     # classification label
             "truth": y,      # LossModule expects truth here
         }
-    
-
-# Import your MNIST model architecture
-# Adjust this import depending on your repo structure
-from mnist_training_example import MNISTModel   # <-- ensure this matches your actual file
 
 
 def build_trained_mnist_model(
@@ -33,7 +30,7 @@ def build_trained_mnist_model(
     strict=True,
 ):
     """
-    Helper to load a trained MNIST model for Stage A Fisher computation or evaluation.
+    Helper to load a trained MNIST model for Fisher computation or evaluation.
 
     Parameters
     ----------
@@ -52,6 +49,9 @@ def build_trained_mnist_model(
         The trained MNIST model in eval() mode on the chosen device.
     """
 
+    # Import here to avoid circular import at module import time
+    from mnist_training_example import MNISTModel
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -64,7 +64,7 @@ def build_trained_mnist_model(
     print(f"[MNIST Wrapper] Loading trained model from: {ckpt_path}")
 
     # 1. Instantiate the architecture
-    model = MNISTModel()      # <-- adjust if your model constructor uses args
+    model = MNISTModel()      # adjust if your model constructor needs args
     model = model.to(device)
 
     # 2. Load checkpoint
@@ -85,7 +85,10 @@ def build_trained_mnist_model(
         try:
             model.module.load_state_dict(state_dict, strict=strict)
         except RuntimeError:
-            print("[MNIST Wrapper] Falling back to loading directly into model (DP mismatch).")
+            print(
+                "[MNIST Wrapper] Falling back to loading directly into model "
+                "(DataParallel mismatch)."
+            )
             model.load_state_dict(state_dict, strict=strict)
     else:
         model.load_state_dict(state_dict, strict=strict)
