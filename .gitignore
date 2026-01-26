@@ -1,3 +1,4 @@
+pruning_plots/*
 */._*.py
 *.pt
 ._*.py
